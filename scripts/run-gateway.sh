@@ -141,7 +141,8 @@ wait_local_health() {
 start_tunnel() {
   : > "$CF_LOG"
   if [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ "${CF_TUNNEL_TOKEN}" != "quick" ] && [ "${CF_TUNNEL_TOKEN}" != "none" ]; then
-    "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" >>"$CF_LOG" 2>&1 &
+    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+      "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
     if [ -n "${ZEN_PUBLIC_HOST:-}" ]; then PUBLIC_URL="https://$ZEN_PUBLIC_HOST"; fi
     say "named tunnel pid=$CF_PID host=${PUBLIC_URL:-<未设置 ZEN_PUBLIC_HOST>}"
@@ -161,7 +162,8 @@ start_tunnel() {
     fi
   else
     warn "没有 CF_TUNNEL_TOKEN，用临时隧道（URL 每次都会变）"
-    "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info --url "http://127.0.0.1:$PORT" >>"$CF_LOG" 2>&1 &
+    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+      "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info --url "http://127.0.0.1:$PORT" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
     local i
     for i in $(seq 1 60); do

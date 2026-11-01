@@ -65,7 +65,15 @@ jobs:
             exit 1
           fi
 
-      - name: Setup sing-box & VPNGate
+      - name: Cache sing-box binary
+        id: cache-singbox
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/sing-box
+          key: sing-box-1.14.4-linux-amd64
+
+      - name: Install sing-box
+        if: steps.cache-singbox.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           V="1.14.4"
@@ -75,13 +83,19 @@ jobs:
           sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version | head -1
 
-          echo "拉取 VPNGate 节点，20 并发探死活 + 20 并发用 bin/zen-direct 真实发消息探测 200..."
-          curl -s -m 60 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
-          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 20 --max-candidates 30 --keep-nodes 3 --mixed-port 18080 || true
+      - name: Setup sing-box & VPNGate (极速 50 探活 + 35 并发单探针 200 + 极速早停)
+        run: |
+          set -euo pipefail
+          echo "拉取 VPNGate 节点 (开启 gzip 极速传输)..."
+          curl -s --compressed -m 20 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
+          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 35 --max-candidates 50 --keep-nodes 3 --mixed-port 18080 || true
 
           if [ -s /tmp/sb.json ]; then
             sing-box run -c /tmp/sb.json > /tmp/singbox.log 2>&1 &
-            sleep 4
+            for i in $(seq 1 30); do
+              if (exec 3<>/dev/tcp/127.0.0.1/18080) 2>/dev/null; then exec 3>&-; break; fi
+              sleep 0.1
+            done
             echo "sing-box 启动完成，监听 127.0.0.1:18080"
             touch /tmp/vpngate_ready
           else
