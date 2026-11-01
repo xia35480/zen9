@@ -1,4 +1,8 @@
-"""极致提速版：50 并发握手粗筛 + 35 并发秒级探测 200 + 极速早停机制。"""
+"""VPNGate 真实对话探活选优器：
+阶段一：50 并发快速全量 TCP 握手探死活，过滤死节点，优先排序独立住宅/商业节点；
+阶段二：20 并发挂载 sing-box 独立端口，通过 zen-direct 真实发包进行多轮对话探测 200（与 run-gateway.sh 探测完全同构）；
+阶段三：首批拿到 2~3 个返回 200 的纯净节点立即极速早停，组建最终 sing-box 代理池（127.0.0.1:18080）。
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,10 +14,21 @@ import socket
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 import vpngate_to_singbox as v2s
+
+PROBE_PAYLOAD = json.dumps({
+    "model": "deepseek-v4.1-flash-free",
+    "messages": [
+        {"role": "system", "content": "You are opencode, a coding agent. Answer concisely."},
+        {"role": "user", "content": "用一句话说明你能做什么。"},
+        {"role": "assistant", "content": "我可以帮你读写代码、运行命令、排查问题。"},
+        {"role": "user", "content": "好，只回复：ok"}
+    ],
+    "max_tokens": 128,
+    "stream": True
+})
 
 
 def wait_port(port: int, proc: subprocess.Popen, deadline: float) -> bool:
@@ -32,13 +47,13 @@ def test_candidate_node(
     idx: int,
     cand: tuple[int, str, str, dict],
     zen_bin: str,
-    probe_body: str,
     singbox_bin: str = "sing-box",
 ) -> dict | None:
     speed, country, country_short, ep = cand
     host, srv_port = v2s.primary_server(ep)
     sb_port = 19100 + idx
-    tag = f"vpn-test-{idx}"
+    gw_port = 19200 + idx
+    tag = f"vpn-cand-{idx}"
     ep_copy = dict(ep)
     ep_copy["tag"] = tag
 
@@ -57,11 +72,13 @@ def test_candidate_node(
     sb_proc = subprocess.Popen([singbox_bin, "run", "-c", cfg_file],
                                stdout=subprocess.DEVNULL, stderr=log_h)
     start_t = time.time()
+    gw_proc = None
+    gw_log = None
     try:
         if not wait_port(sb_port, sb_proc, time.time() + 8):
             return None
 
-        # 极速等待隧道建立（使用超轻量 HTTP 204 代替耗时 HTTPS，每 0.25s 探测一次）
+        # 1. 快速等待隧道建立（使用超轻量 HTTP 204，每 0.25s 探测一次，确认 tunnel 导通）
         tunnel_ok = False
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -69,9 +86,9 @@ def test_candidate_node(
                 break
             try:
                 r = subprocess.run(
-                    ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "1.2",
+                    ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "1.5",
                      "-x", f"http://127.0.0.1:{sb_port}", "http://cp.cloudflare.com/generate_204"],
-                    capture_output=True, text=True, timeout=1.8,
+                    capture_output=True, text=True, timeout=2,
                 )
                 if (r.stdout or "").strip() in ("204", "200"):
                     tunnel_ok = True
@@ -83,25 +100,45 @@ def test_candidate_node(
         if not tunnel_ok:
             return None
 
-        # 隧道已通！直接调用 bin/zen-direct 纯探针模式（单次发包退出，仅需 400ms，无需启动网关端口）
-        probe_ses = f"ses_{uuid.uuid4().hex[:20]}"
-        probe_env = dict(
+        # 2. 隧道通后，启动配套临时网关（与原模板完全一致的网关环境与会话池）
+        gw_env = dict(
             os.environ,
+            PORT=str(gw_port),
             HTTPS_PROXY=f"http://127.0.0.1:{sb_port}",
             HTTP_PROXY=f"http://127.0.0.1:{sb_port}",
-            ALL_PROXY=f"http://127.0.0.1:{sb_port}",
             NO_PROXY="127.0.0.1,localhost",
-            ZEN_PROBE_BODY=probe_body,
-            ZEN_PROBE_SESSION=probe_ses,
-            ZEN_PROBE_UA="opencode/latest/2.2.5/cli",
             ZEN_TLS="bun",
+            DIRECT_SIDECAR="off",
+            DIRECT_CONCURRENCY="4",
         )
-        res = subprocess.run([zen_bin], env=probe_env, capture_output=True, text=True, timeout=12)
-        out = (res.stdout or "") + (res.stderr or "")
+        for k in ["ALL_PROXY", "all_proxy"]:
+            gw_env.pop(k, None)
+
+        gw_log = open(f"/tmp/gw_cand_{idx}.log", "wb")
+        gw_proc = subprocess.Popen([zen_bin], env=gw_env, stdout=subprocess.DEVNULL, stderr=gw_log)
+
+        if not wait_port(gw_port, gw_proc, time.time() + 5):
+            return None
+
+        # 3. 发送与 run-gateway.sh 完全一致的真实 chat completions 探活请求
+        res = subprocess.run(
+            [
+                "curl", "-sS", "-i", "-m", "15",
+                "--noproxy", "127.0.0.1,localhost",
+                "-H", "Content-Type: application/json",
+                "-H", "Authorization: Bearer public",
+                "-H", "User-Agent: zen-probe",
+                "--data-binary", PROBE_PAYLOAD,
+                f"http://127.0.0.1:{gw_port}/v1/chat/completions",
+            ],
+            capture_output=True, text=True, timeout=18,
+        )
+        raw_resp = (res.stdout or "")
         elapsed_ms = int((time.time() - start_t) * 1000)
 
-        if res.returncode == 0 or "-> 200" in out:
-            print(f"[VERIFIED 200] 节点 #{idx:02d} {host}:{srv_port} ({country_short}) 探测成功: {elapsed_ms}ms", flush=True)
+        # 4. 判断是否真正返回 200
+        if "HTTP/1.1 200" in raw_resp or "HTTP/2 200" in raw_resp:
+            print(f"[VERIFIED 200] 节点 #{idx:02d} {host}:{srv_port} ({country_short}) 真实发包 200 通过! (耗时 {elapsed_ms}ms)", flush=True)
             return {
                 "endpoint": ep_copy,
                 "server": host,
@@ -111,19 +148,27 @@ def test_candidate_node(
                 "latency_ms": elapsed_ms,
             }
         else:
-            first_line = out.strip().split("\n")[0] if out.strip() else f"rc={res.returncode}"
-            print(f"[REJECTED] 节点 #{idx:02d} {host}:{srv_port} 未过 200: {first_line[:90]}", flush=True)
+            first_line = raw_resp.strip().split("\n")[0] if raw_resp.strip() else f"rc={res.returncode}"
+            print(f"[REJECTED] 节点 #{idx:02d} {host}:{srv_port} 真实发包未过 200: {first_line[:90]}", flush=True)
             return None
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         return None
     finally:
+        if gw_proc is not None:
+            gw_proc.terminate()
+            try:
+                gw_proc.wait(1.5)
+            except subprocess.TimeoutExpired:
+                gw_proc.kill()
+        if gw_log is not None:
+            gw_log.close()
         sb_proc.terminate()
         try:
             sb_proc.wait(1.5)
         except subprocess.TimeoutExpired:
             sb_proc.kill()
         log_h.close()
-        for f in [cfg_file, log_file]:
+        for f in [cfg_file, log_file, f"/tmp/gw_cand_{idx}.log"]:
             try:
                 os.remove(f)
             except OSError:
@@ -131,14 +176,13 @@ def test_candidate_node(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="极致并发探活与选择可用 200 节点")
+    parser = argparse.ArgumentParser(description="VPNGate 真实对话探活选优器")
     parser.add_argument("--csv", required=True, help="VPNGate snapshot CSV file")
     parser.add_argument("--output", default="/tmp/sb.json", help="Output sing-box config path")
     parser.add_argument("--zen-bin", default="bin/zen-direct", help="Path to zen-direct binary")
-    parser.add_argument("--probe-body", default="scripts/probe_body.json", help="Path to probe_body.json")
     parser.add_argument("--singbox-bin", default="sing-box", help="Path to sing-box binary")
-    parser.add_argument("--concurrency", type=int, default=35, help="Concurrency for probes (default 35)")
-    parser.add_argument("--max-candidates", type=int, default=50, help="Max candidates for phase 2 (default 50)")
+    parser.add_argument("--concurrency", type=int, default=20, help="Concurrency for real probes (default 20)")
+    parser.add_argument("--max-candidates", type=int, default=35, help="Max candidates for phase 2 (default 35)")
     parser.add_argument("--keep-nodes", type=int, default=3, help="Number of verified 200 nodes to keep (default 3)")
     parser.add_argument("--mixed-port", type=int, default=18080, help="Production mixed inbound port (default 18080)")
     args = parser.parse_args()
@@ -170,9 +214,10 @@ def main() -> int:
                 alive_candidates.append(res)
 
     def rank_key(cand):
+        # cand: (lat, speed, country, country_short, ep)
         ep = cand[4]
         host, _ = v2s.primary_server(ep)
-        # 筑波大学公共总机房段（219.100.37.x 等）常年被数千人刷满 429
+        # 筑波大学公共总机房段（219.100.37.x、150.40.105.x）常年被数千人刷满 429
         # 将干净的独立住宅/商业志愿节点排在最前，公共滥用段放最后，极大提升 200 命中率！
         is_abused = host.startswith("219.100.37.") or host.startswith("150.40.105.")
         return (1 if is_abused else 0, cand[0])
@@ -186,10 +231,10 @@ def main() -> int:
         return 1
 
     # =========================================================================
-    # 阶段二：35 并发通过 sing-box 连接 zen-direct 真实发包探测 200（极速早停）
+    # 阶段二：20 并发通过 sing-box 连接 zen-direct 真实发包探测 200（极速早停）
     # =========================================================================
     test_pool = alive_candidates[: args.max_candidates]
-    print(f"\n[阶段二] 启动 {args.concurrency} 并发真实发消息探测 200（早停阈值={args.keep_nodes} 个）...", flush=True)
+    print(f"\n[阶段二] 启动 {args.concurrency} 并发连接 zen-direct 真实对话探测 200（早停阈值={args.keep_nodes} 个）...", flush=True)
     verified_nodes: list[dict] = []
     t1 = time.time()
 
@@ -200,7 +245,6 @@ def main() -> int:
                 i,
                 (cand[1], cand[2], cand[3], cand[4]),
                 args.zen_bin,
-                args.probe_body,
                 args.singbox_bin,
             ): cand
             for i, cand in enumerate(test_pool)
@@ -211,7 +255,7 @@ def main() -> int:
                 if res is not None:
                     verified_nodes.append(res)
                     if len(verified_nodes) >= args.keep_nodes:
-                        print(f"\n[极速早停] 已凑齐前 {len(verified_nodes)} 个实测 200 节点，立即收工！", flush=True)
+                        print(f"\n[极速早停] 已成功通过真实发包拿到前 {len(verified_nodes)} 个实测 200 节点，立即收工！", flush=True)
                         for f in futures:
                             f.cancel()
                         break
