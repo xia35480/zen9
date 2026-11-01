@@ -1,0 +1,136 @@
+name: zen-gateway-vpngate
+
+# VPNGate / OpenVPN 特例节点模板：
+#   基于 sing-box openvpn-client 接入 VPNGate 节点池，为网关提供住宅/商业宽带出口。
+#   4 小时软交班 + 硬超时兜底 + 故障转移。
+#   网关直接复用预编译二进制（bin/zen-direct）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_run_sec:
+        description: "本次运行时长上限（秒），调试用；默认 3h50m 主动交班"
+        required: false
+        default: "13800"
+  schedule:
+    - cron: "*/20 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: zen-gateway
+  cancel-in-progress: false
+
+env:
+  PORT: "8081"
+  PROBE_MODEL: deepseek-v4.1-flash-free
+  PROBE_INTERVAL_SEC: "300"
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prune old runs (keep 3)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo="${{ github.repository }}"
+          keep=3
+          gh api "repos/$repo/actions/workflows/gateway.yml/runs?per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed")] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
+          | while read -r id; do
+              [ -n "$id" ] || continue
+              [ "$id" = "${{ github.run_id }}" ] && continue
+              gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1 || true
+            done
+
+      - name: Check binary
+        run: |
+          set -euo pipefail
+          chmod +x bin/zen-direct
+          sha256sum bin/zen-direct
+          rc=0
+          ZEN_PROBE_BODY=/nonexistent/zen-probe bin/zen-direct >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "2" ]; then
+            echo "::error::bin/zen-direct 跑不起来（rc=$rc）"
+            exit 1
+          fi
+
+      - name: Setup sing-box & VPNGate
+        run: |
+          set -euo pipefail
+          V="1.14.4"
+          echo "安装 sing-box $V"
+          curl -sL -m 60 -o /tmp/sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v${V}/sing-box-${V}-linux-amd64.tar.gz"
+          tar xzf /tmp/sb.tgz -C /tmp
+          sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version | head -1
+
+          echo "拉取 VPNGate 节点，20 并发探死活 + 20 并发用 bin/zen-direct 真实发消息探测 200..."
+          curl -s -m 60 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
+          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 20 --max-candidates 30 --keep-nodes 3 --mixed-port 18080 || true
+
+          if [ -s /tmp/sb.json ]; then
+            sing-box run -c /tmp/sb.json > /tmp/singbox.log 2>&1 &
+            sleep 4
+            echo "sing-box 启动完成，监听 127.0.0.1:18080"
+            touch /tmp/vpngate_ready
+          else
+            echo "未筛选出可用节点，使用原生网络兜底"
+          fi
+
+      - name: Install cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x bin/cloudflared
+          bin/cloudflared --version
+
+      - name: Serve, tunnel, keepalive
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
+          PROXY_URL: ${{ vars.PROXY_URL }}
+        run: bash scripts/run-gateway.sh
+
+      - name: Handoff and summary
+        if: always() && !cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
+          {
+            echo "### zen-gateway-vpngate"
+            echo ""
+            echo "- 模板类型：\`VPNGate + sing-box OpenVPN\`"
+            echo "- 交班原因：\`$reason\`"
+            echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
+            echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
+            echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
+            echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f run/no-handoff ]; then
+            echo "::error::配置错误，已停止交班；修好后手动 Run workflow"
+            exit 0
+          fi
+
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/gateway.yml/dispatches" \
+            -d '{"ref":"main"}' || echo 000)"
+          echo "dispatch next run -> HTTP $code"
