@@ -261,7 +261,10 @@ while [ "$attempt" -lt "$BOOT_TRIES" ]; do
       if [ "$attempt" -lt "$BOOT_TRIES" ]; then
         warn "VPNGate 出口命中 429，尝试热切换下一个已验证节点 (第 $attempt/$BOOT_TRIES 次)..."
         try_vpngate_switch || true
-        sleep 2
+        stop_proc "$GW_PID" gateway
+        start_gateway
+        wait_local_health 60 || true
+        sleep 1
       else
         dump_boot_diag
         rotate "起手本地探测 429（换节点试了 $BOOT_TRIES 次）：${PROBE_BODY:0:200}" fast
@@ -313,6 +316,9 @@ while :; do
     say "捕获到日志 429，尝试 VPNGate 热切换下一个节点自愈..."
     : > "$REASON"
     try_vpngate_switch || true
+    stop_proc "$GW_PID" gateway
+    start_gateway
+    wait_local_health 60 || true
     probe_once "$BOOT_BASE" 30
     if [ "$(verdict)" != "ok" ]; then
       rotate "日志命中 429 且换节点后仍失败" fast
@@ -354,6 +360,9 @@ while :; do
         limit_count=$((limit_count + 1))
         warn "周期探测 429，自动切换下一个 VPNGate 节点自愈..."
         try_vpngate_switch || true
+        stop_proc "$GW_PID" gateway
+        start_gateway
+        wait_local_health 60 || true
         probe_once
         if [ "$(verdict)" = "ok" ]; then
           say "VPNGate 换节点成功自愈！"
