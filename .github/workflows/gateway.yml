@@ -2,16 +2,16 @@ name: zen-gateway-vpngate
 
 # VPNGate / OpenVPN 特例节点模板：
 #   基于 sing-box openvpn-client 接入 VPNGate 节点池，为网关提供住宅/商业宽带出口。
-#   4 小时软交班 + 硬超时兜底 + 故障转移。
+#   3 小时软交班 + 硬超时兜底 + 故障转移。
 #   网关直接复用预编译二进制（bin/zen-direct）。
 
 on:
   workflow_dispatch:
     inputs:
       max_run_sec:
-        description: "本次运行时长上限（秒），调试用；默认 3h50m 主动交班"
+        description: "本次运行时长上限（秒），调试用；默认 3h 主动交班"
         required: false
-        default: "13800"
+        default: "10800"
   schedule:
     - cron: "*/20 * * * *"
 
@@ -31,7 +31,7 @@ env:
 jobs:
   serve:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 210
 
     steps:
       - name: Checkout
@@ -115,7 +115,7 @@ jobs:
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
-          MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '10800' }}
           PROXY_URL: ${{ vars.PROXY_URL }}
         run: bash scripts/run-gateway.sh
 
@@ -134,6 +134,7 @@ jobs:
             echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
             echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
             echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
+            echo "- 隧道观测：$(cat run/tunnel-stats.txt 2>/dev/null || echo '?')"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ -f run/no-handoff ]; then
